@@ -1,4 +1,8 @@
+package de.dkfz.odcf.fqindexer
+
 import groovy.transform.CompileStatic
+
+import static Constants.*
 
 @CompileStatic
 class Test {
@@ -13,42 +17,17 @@ class Test {
     File namedPipe2 = new File("/data/michael/temp/test.fastq.fifo2")
     File namedPipe3 = new File("/data/michael/temp/test.fastq.fifo3")
 
-    File md5file = new File(fastqfile.absolutePath + "_md5sum")
-    File linecountfile = new File(fastqfile.absolutePath + "_linecount")
+    File md5file = new File(fastqfile.absolutePath + MD5_SUFFIX)
+    File linecountfile = new File(fastqfile.absolutePath + LINECOUNT_SUFFIX)
 
     List<Thread> listOfStartedThreads = [].asSynchronized()
     List<File> chunkMD5Files = [].asSynchronized()
     List<File> linecountFiles = [].asSynchronized()
 
-    static int exec(String command) {
-        println "Running command: ${command}"
-        def proc = (["bash", "-c", "${command}"]).execute()
-        int res = proc.waitFor()
-        println proc.errorStream.text
-        return res
-    }
-
-    Thread run(String threadID, String command, File file) {
-        if (!file.exists()) {
-            return Thread.start {
-                println "Started ${threadID} Thread: ${command}"
-                int res = exec(command)
-                if (res != 0) {
-                    println("${threadID} Thread failed with ${res}. Deleting result file.")
-                    file.delete()
-                } else {
-                    println "Thread ${threadID} finished"
-                }
-            }
-        } else {
-            println "File ${file} already existed. Won't run Thread ${threadID}."
-        }
-    }
 
     static void main(String[] args) {
         new Test().run(args)
     }
-
 
     List<Thread> waitForThreads() {
         listOfStartedThreads.findAll().each { Thread t -> t.join() }
@@ -68,7 +47,8 @@ class Test {
 
         runTests()
 
-        if (!compareMD5Files()) {
+        new ConsistencyChecks(md5file.parentFile).check()
+        if (!Methods.compareStatusFiles(md5file, chunkMD5Files, linecountfile, linecountFiles)) {
             println "MD5 files or Linecount files differ, please check the job or process output! Test failed."
             System.exit(3)
         }
@@ -93,8 +73,8 @@ class Test {
             namedPipe1 = new File(outputBase, fastqfile.name + ".np1")
             namedPipe2 = new File(outputBase, fastqfile.name + ".np2")
             namedPipe3 = new File(outputBase, fastqfile.name + ".np3")
-            md5file = new File(outputBase, fastqfile.name + ".md5")
-            linecountfile = new File(outputBase, fastqfile.name + ".lc")
+            md5file = new File(outputBase, fastqfile.name + MD5_SUFFIX)
+            linecountfile = new File(outputBase, fastqfile.name + LINECOUNT_SUFFIX)
             println "Working with the following files and pipes:" +
                     "\n\t${fastqfile}" +
                     "\n\t${indexfile}" +
@@ -137,7 +117,7 @@ class Test {
     boolean prepareIndexAndMetafiles() {
 // Create named pipe for shared input.
         if (!namedPipe1.exists()) {
-            exec("mkfifo '${namedPipe1}' '${namedPipe2}' '${namedPipe3}'")
+            Methods.exec("mkfifo '${namedPipe1}' '${namedPipe2}' '${namedPipe3}'")
         }
 
         if (!md5file.exists() || !linecountfile.exists() || !indexpipefile.exists()) {
@@ -145,25 +125,25 @@ class Test {
             if (linecountfile.exists()) linecountfile.delete()
             if (indexpipefile.exists()) indexpipefile.delete()
 
-            listOfStartedThreads << run("md5", "cat '${namedPipe1}' | gunzip -c | md5sum > '${md5file}'", md5file)
-            listOfStartedThreads << run("linecount", "cat '${namedPipe2}' | gunzip -c | wc -l > '${linecountfile}'", linecountfile)
-            listOfStartedThreads << run("pipedIndex", "cat '${namedPipe3}' | fastqindex index -w -f=- -i='${indexpipefile}' -b=128", indexpipefile)
+            listOfStartedThreads << Methods.run("md5", "cat '${namedPipe1}' | gunzip -c | md5sum > '${md5file}'", md5file)
+            listOfStartedThreads << Methods.run("linecount", "cat '${namedPipe2}' | gunzip -c | wc -l > '${linecountfile}'", linecountfile)
+            listOfStartedThreads << Methods.run("pipedIndex", "cat '${namedPipe3}' | fastqindex index -l='${outputBase}/pipe_' -w -f=- -i='${indexpipefile}' -b=128", indexpipefile)
             if (listOfStartedThreads) {
                 listOfStartedThreads << Thread.start {
-                    exec("cat '${fastqfile}' | tee '${namedPipe1}' '${namedPipe2}' > '${namedPipe3}'")
+                    Methods.exec("cat '${fastqfile}' | tee '${namedPipe1}' '${namedPipe2}' > '${namedPipe3}'")
                 }
             }
         } else {
             println "md5sum, linecount and piped index file already exist."
         }
 
-        listOfStartedThreads << run("index", "fastqindex index -f='${fastqfile}' -i='${indexfile}' -b=128", indexfile)
+        listOfStartedThreads << Methods.run("index", "fastqindex index -l='${outputBase}/line_' -f='${fastqfile}' -i='${indexfile}' -b=128", indexfile)
 
         waitForThreads()
 
         if (md5file.size() == 0 || linecountfile.size() == 0 || indexfile.size() == 0 || indexfile.size() != indexpipefile.size()) {
-            println "Check file sizes, something went wrong."
-            return false
+            println "WARNING: Check file sizes, something might have went wrong! Note, that pipe and file-based index files differ in some cases."
+            return true
         }
         return true
     }
@@ -176,7 +156,7 @@ class Test {
             println "Testing with ${chunks} chunks"
             long modulo = noOfRecords % chunks
             long chunksize = (long) (noOfRecords / chunks) as long
-            println "Caluclated a chunk size of ${chunksize} with a modulo of ${modulo} resulting in a total of ${chunksize * chunks + modulo} entries compared to ${noOfRecords}"
+            println "Calculated a chunk size of ${chunksize} with a modulo of ${modulo} resulting in a total of ${chunksize * chunks + modulo} entries compared to ${noOfRecords}"
             List<File> chunkFilesByFile = createChunkFiles(indexfile, "file", chunks, chunksize, modulo)
             waitForThreads()
             List<File> chunkFilesByPipe = createChunkFiles(indexpipefile, "pipe", chunks, chunksize, modulo)
@@ -206,7 +186,7 @@ class Test {
                 count += modulo
             if (!chunkFiles[-1].exists()) { // Only create, if necessary
                 def cmdByFile = "fastqindex extract -f='${fastqfile}' -i='${index}' -s=${i * chunksize} -n=${count} -o='${chunkFiles[-1]}'"
-                listOfStartedThreads << run(chunkFiles[-1].name, cmdByFile, chunkFiles[-1])
+                listOfStartedThreads << Methods.run(chunkFiles[-1].name, cmdByFile, chunkFiles[-1])
             }
         }
         return chunkFiles
@@ -218,21 +198,21 @@ class Test {
         listOfStartedThreads << Thread.start {
             File npLinecount = new File(chunkDir, "npLinecount")
             File npMD5sum = new File(chunkDir, "npMD5sum")
-            File mergedMD5sumFile = new File("${mergedFile}_md5sum")
-            File lineCountfile = new File("${mergedFile}_linecount")
+            File mergedMD5sumFile = new File("${mergedFile}.md5")
+            File lineCountfile = new File("${mergedFile}.lc")
 
             chunkMD5Files << mergedMD5sumFile
             linecountFiles << lineCountfile
 
-            exec("mkfifo '${npLinecount}' '${npMD5sum}'")
+            Methods.exec("mkfifo '${npLinecount}' '${npMD5sum}'")
             Thread lineCount = Thread.start {
-                exec("cat '${npLinecount}' | wc -l > '${lineCountfile}'")
+                Methods.exec("cat '${npLinecount}' | wc -l > '${lineCountfile}'")
             }
             Thread md5sum = Thread.start {
-                exec("cat '${npMD5sum}' | md5sum > '${mergedMD5sumFile}'")
+                Methods.exec("cat '${npMD5sum}' | md5sum > '${mergedMD5sumFile}'")
             }
             Thread chunkThread = Thread.start {
-                exec("cat '${chunkFiles.join("' '")}' | tee ${npLinecount} ${npMD5sum} > ${mergedFile}")
+                Methods.exec("cat '${chunkFiles.join("' '")}' | tee ${npLinecount} ${npMD5sum} > ${mergedFile}")
             }
             lineCount.join()
             md5sum.join()
@@ -244,18 +224,4 @@ class Test {
         }
     }
 
-    boolean compareMD5Files() {
-        String reference = md5file.text
-        boolean md5Equals = true
-        chunkMD5Files.each {
-            md5Equals &= reference == it.text
-        }
-
-        String lcRef = linecountfile.text
-        boolean lcEquals = true
-        linecountFiles.each {
-            lcEquals &= lcRef == it.text
-        }
-        return md5Equals && lcEquals
-    }
 }
